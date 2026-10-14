@@ -123,7 +123,7 @@ class AdminStates(StatesGroup):
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
   # Сюда позже вставишь ссылку на свою витрину с Hugging Face Static
-  web_app_url = "https://Aufchik-school-shop.hf.space"
+  web_app_url = "https://aufchik-school-shop.static.hf.space"
   kb = InlineKeyboardMarkup(
       inline_keyboard=[[
           InlineKeyboardButton(
