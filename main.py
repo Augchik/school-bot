@@ -1,24 +1,20 @@
-import asyncio
-import datetime
-import json
-import logging
 import os
-import aiosqlite
-import pytz
-from aiogram import Bot, Dispatcher, F, types
-from aiogram.filters import Command
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
+import json
+import asyncio
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-import uvicorn
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.filters import Command
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.context import FSMContext
 
-BOT_TOKEN = "8613597120:AAHcGm6MKyNZq5m1hVwIPf6G6ENSe_Q7uRU"
-ADMIN_IDS = [5114807748, 5545174715, 6319212519, 5248254181]
-PORT = int(os.environ.get("PORT", 10000))
+# ---------------- CONFIG ----------------
+BOT_TOKEN = os.getenv("BOT_TOKEN", "ТОКЕН_БОТА")
+ADMIN_IDS = [123456789]  # Вставь свой Telegram ID
 
-logging.basicConfig(level=logging.INFO)
+web_app_url = "https://aufchik-school-shop.hf.space"
+
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 app = FastAPI()
@@ -31,423 +27,430 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-DB_FILE = "shop.db"
+# Хранилища в памяти
+DATA_FILE = "data.json"
 
+def load_data():
+    if not os.path.exists(DATA_FILE):
+        return {
+            "products": [],
+            "orders": [],
+            "blacklist": [],
+            "room_number": "не указан",
+            "support_tickets": [],
+            "accepted_rules": []
+        }
+    with open(DATA_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)
 
-async def init_db():
-  async with aiosqlite.connect(DB_FILE) as db:
-    await db.execute("""
-            CREATE TABLE IF NOT EXISTS products (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                title TEXT,
-                price INTEGER,
-                image TEXT
-            )
-        """)
-    await db.execute("""
-            CREATE TABLE IF NOT EXISTS settings (
-                key TEXT PRIMARY KEY,
-                value TEXT
-            )
-        """)
-    await db.execute("""
-            CREATE TABLE IF NOT EXISTS orders (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
-                username TEXT,
-                full_name TEXT,
-                items TEXT,
-                total INTEGER,
-                status TEXT DEFAULT 'Новый',
-                taken_by TEXT DEFAULT NULL,
-                created_at TEXT
-            )
-        """)
-    await db.commit()
+def save_data(data):
+    with open(DATA_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
 
-    async with db.execute(
-        "SELECT value FROM settings WHERE key='work_hours'"
-    ) as cursor:
-      row = await cursor.fetchone()
-      if not row:
-        await db.execute(
-            "INSERT INTO settings (key, value) VALUES ('work_hours', '16:00-18:00')"
-        )
-        await db.commit()
+db = load_data()
 
-
-async def get_work_hours():
-  async with aiosqlite.connect(DB_FILE) as db:
-    async with db.execute(
-        "SELECT value FROM settings WHERE key='work_hours'"
-    ) as cursor:
-      row = await cursor.fetchone()
-      return row[0] if row else "16:00-18:00"
-
-
-async def is_shop_open() -> bool:
-  hours_str = await get_work_hours()
-  try:
-    start_str, end_str = hours_str.split("-")
-    tz = pytz.timezone("Europe/Moscow")
-    now = datetime.datetime.now(tz)
-    current_time = now.strftime("%H:%M")
-    return start_str <= current_time <= end_str
-  except Exception:
-    return True
-
-
-@app.get("/api/products")
-async def api_get_products():
-  async with aiosqlite.connect(DB_FILE) as db:
-    db.row_factory = aiosqlite.Row
-    async with db.execute("SELECT * FROM products") as cursor:
-      products = [dict(row) async for row in cursor]
-  return products
-
-
-@app.get("/api/settings")
-async def api_get_settings():
-  hours = await get_work_hours()
-  open_status = await is_shop_open()
-  return {"work_hours": hours, "is_open": open_status}
-
-
+# ---------------- FSM ----------------
 class AdminStates(StatesGroup):
-  waiting_for_title = State()
-  waiting_for_price = State()
-  waiting_for_image = State()
-  waiting_for_hours = State()
+    waiting_for_title = State()
+    waiting_for_price = State()
+    waiting_for_stock = State()
+    waiting_for_image = State()
+    waiting_for_room = State()
 
+class SupportStates(StatesGroup):
+    waiting_for_message = State()
+    waiting_for_reply = State()
 
+# ---------------- FASTAPI API ----------------
+@app.get("/api/products")
+def get_products():
+    return db["products"]
+
+# ---------------- BOT HANDLERS ----------------
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
-  # Сюда позже вставишь ссылку на свою витрину с Hugging Face Static
-  web_app_url = "https://aufchik-school-shop.static.hf.space"
-  kb = InlineKeyboardMarkup(
-      inline_keyboard=[[
-          InlineKeyboardButton(
-              text="🍕 Открыть каталог буфета",
-              web_app=WebAppInfo(url=web_app_url),
-          )
-      ]]
-  )
-  await message.answer(
-      "Привет! 👋 Добро пожаловать в школьный буфет.\n"
-      "Нажми кнопку ниже, чтобы открыть каталог товаров:",
-      reply_markup=kb,
-  )
+    user_id = message.from_user.id
+    if user_id in db.get("blacklist", []):
+        await message.answer("❌ **Вы заблокированы в системе** за неявку за заказом.\nЕсли это ошибка, обратитесь в поддержку с помощью команды `/teh`.")
+        return
 
-
-@dp.message(F.web_app_data)
-async def process_web_app_order(message: types.Message):
-  if not await is_shop_open():
-    hours = await get_work_hours()
-    await message.answer(
-        f"❌ Извините, магазин сейчас закрыт!\nПрием заказов по графику: {hours}"
-    )
-    return
-
-  try:
-    cart = json.loads(message.web_app_data.data)
-    total = sum(item["price"] * item["count"] for item in cart)
-    items_text = "\n".join(
-        [
-            f"• {i['title']} x{i['count']} — {i['price'] * i['count']} ₽"
-            for i in cart
-        ]
-    )
-
-    tz = pytz.timezone("Europe/Moscow")
-    created_at = datetime.datetime.now(tz).strftime("%H:%M %d.%m.%Y")
-
-    async with aiosqlite.connect(DB_FILE) as db:
-      await db.execute(
-          "INSERT INTO orders (user_id, username, full_name, items, total,"
-          " created_at) VALUES (?, ?, ?, ?, ?, ?)",
-          (
-              message.from_user.id,
-              message.from_user.username or "нет",
-              message.from_user.full_name,
-              items_text,
-              total,
-              created_at,
-          ),
-      )
-      await db.commit()
-
-    await message.answer(
-        f"✅ **Заказ успешно оформлен!**\n\n{items_text}\n\n💰 **Итого:** {total}"
-        f" ₽\n\nМы скоро свяжемся с вами для выдачи!"
-    )
-
-    for admin_id in ADMIN_IDS:
-      try:
-        await bot.send_message(
-            admin_id,
-            f"🚨 **Новый заказ!**\n\nОт: {message.from_user.full_name}"
-            f" (@{message.from_user.username or 'нет'})\n{items_text}\n\n💰"
-            f" Сумма: {total} ₽\n\nИспользуйте /zakaz чтобы взять заказ в работу.",
-            parse_mode="Markdown",
+    # Проверяем, принял ли пользователь правила
+    if user_id not in db.get("accepted_rules", []):
+        rules_text = (
+            "📜 **Пользовательское соглашение и правила школьного буфета:**\n\n"
+            "1. Настоящий бот является информационной системой для предварительного заказа продукции в школьном буфете.\n"
+            "2. Оформляя заказ, пользователь подтверждает свое согласие на покупку выбранных позиций и берет на себя **полную личную ответственность** за своевременный самовывоз заказа в назначенное время (дата и номер перемены) и место (раздевалка).\n"
+            "3. Заказы, оставленные без забора (неявка), фиксируются администрацией. При повторных нарушениях пользователь автоматически вносится в **черный список (ЧС)** с правом обжалования через техническую поддержку (`/teh`).\n"
+            "4. Администрация не несет ответственности за технические сбои связи или задержки учебного процесса.\n\n"
+            "Нажимая кнопку ниже, вы подтверждаете ознакомление и полное согласие с правилами."
         )
-      except:
-        pass
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="✅ Я согласен с правилами", callback_data="accept_rules")
+        ]])
+        await message.answer(rules_text, reply_markup=kb)
+        return
 
-  except Exception as e:
-    logging.error(f"Order error: {e}")
-    await message.answer("Произошла ошибка при обработке заказа.")
+    await show_main_menu(message)
 
+async def show_main_menu(message: types.Message):
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🍕 Открыть каталог буфета", web_app=WebAppInfo(url=web_app_url))],
+        [InlineKeyboardButton(text="📦 Мои заказы", callback_data="my_orders"), InlineKeyboardButton(text="🆘 Техподдержка", callback_data="open_teh")]
+    ])
+    await message.answer("Привет! Добро пожаловать в школьный буфет 🥪\n\nИспользуйте меню ниже для работы с системой:", reply_markup=kb)
 
+@dp.callback_query(F.data == "accept_rules")
+async def process_accept_rules(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    if user_id not in db["accepted_rules"]:
+        db["accepted_rules"].append(user_id)
+        save_data(db)
+    await callback.message.delete()
+    await callback.message.answer("🎉 Спасибо за согласие с правилами!")
+    await show_main_menu(callback.message)
+
+@dp.callback_query(F.data == "open_teh")
+async def callback_open_teh(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.answer("📝 Напишите ваше обращение/жалобу одним сообщением. Поддержка ответит вам в ближайшее время:")
+    await state.set_state(SupportStates.waiting_for_message)
+
+# --- Прием заказа из WebApp ---
+@dp.message(F.web_app_data)
+async def process_web_app_data(message: types.Message):
+    user_id = message.from_user.id
+    if user_id in db.get("blacklist", []):
+        await message.answer("❌ Вы не можете оформлять заказы, так как находитесь в черном списке. Обратитесь в `/teh`.")
+        return
+
+    data = json.loads(message.web_app_data.data)
+
+    # Проверка и списание остатков на складе
+    for item in data["items"]:
+        prod = next((p for p in db["products"] if p["id"] == item["id"]), None)
+        if not prod or prod["stock"] < item["quantity"]:
+            await message.answer(f"❌ Ошибка! Товара «{item['title']}» осталось недостаточно на складе.")
+            return
+
+    # Уменьшаем остатки
+    for item in data["items"]:
+        for prod in db["products"]:
+            if prod["id"] == item["id"]:
+                prod["stock"] -= item["quantity"]
+    
+    order_id = len(db["orders"]) + 1
+    order_info = {
+        "id": order_id,
+        "user_id": user_id,
+        "username": message.from_user.username or "без username",
+        "full_name": message.from_user.full_name,
+        "items": data["items"],
+        "total": data["total"],
+        "date": data["date"],
+        "break_number": data["break_number"],
+        "status": "Новый"
+    }
+    db["orders"].append(order_info)
+    save_data(db)
+
+    room = db.get("room_number", "не указан")
+    items_text = "\n".join([f"• {i['title']} x{i['quantity']} ({i['price']*i['quantity']} ₽)" for i in data["items"]])
+
+    await message.answer(
+        f"✅ **Заказ #{order_id} принят!**\n\n"
+        f"📋 **Состав:**\n{items_text}\n\n"
+        f"💰 **Сумма:** {data['total']} ₽\n"
+        f"📅 **Дата:** {data['date']}\n"
+        f"⏰ **Перемена:** {data['break_number']}-я перемена\n"
+        f"📍 **Место выдачи:** Раздевалка № {room}\n\n"
+        f"⚠️ *Обязательно приходите вовремя! Неявка ведет к внесению в ЧС.*"
+    )
+
+    admin_msg = (
+        f"📥 **НОВЫЙ ЗАКАЗ #{order_id}**\n"
+        f"Покупатель: {message.from_user.full_name} (@{order_info['username']})\n"
+        f"Дата: {data['date']} | Перемена: {data['break_number']}\n"
+        f"Сумма: {data['total']} ₽\n\n"
+        f"Состав:\n{items_text}"
+    )
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(admin_id, admin_msg)
+        except:
+            pass
+
+# --- ИСТОРИЯ ЗАКАЗОВ (/history) ---
+@dp.message(Command("history"))
+async def cmd_history(message: types.Message):
+    user_id = message.from_user.id
+    user_orders = [o for o in db["orders"] if o["user_id"] == user_id]
+
+    if not user_orders:
+        await message.answer("📦 У вас пока нет оформленных заказов.")
+        return
+
+    text = "📜 **Ваша история заказов:**\n\n"
+    for o in user_orders[-5:]:  включая последние 5 заказов
+        items_str = ", ".join([f"{i['title']} x{i['quantity']}" for i in o['items']])
+        text += f"• **Заказ #{o['id']}** ({o['status']})\n  📅 {o['date']} | {o['break_number']} перемена\n  🛒 {items_str}\n  💰 Итого: {o['total']} ₽\n\n"
+
+    await message.answer(text)
+
+@dp.callback_query(F.data == "my_orders")
+async def callback_my_orders(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    user_orders = [o for o in db["orders"] if o["user_id"] == user_id]
+
+    if not user_orders:
+        await callback.message.answer("📦 У вас пока нет оформленных заказов.")
+        return
+
+    text = "📜 **Ваша история заказов:**\n\n"
+    for o in user_orders[-5:]:
+        items_str = ", ".join([f"{i['title']} x{i['quantity']}" for i in o['items']])
+        text += f"• **Заказ #{o['id']}** ({o['status']})\n  📅 {o['date']} | {o['break_number']} перемена\n  🛒 {items_str}\n  💰 Итого: {o['total']} ₽\n\n"
+
+    await callback.message.answer(text)
+
+# --- АДМИН ПАНЕЛЬ (/admin) ---
 @dp.message(Command("admin"))
 async def cmd_admin(message: types.Message):
-  if message.from_user.id not in ADMIN_IDS:
-    return
-  kb = InlineKeyboardMarkup(
-      inline_keyboard=[
-          [
-              InlineKeyboardButton(
-                  text="➕ Добавить товар", callback_data="adm_add"
-              ),
-              InlineKeyboardButton(
-                  text="🗑 Удалить товар", callback_data="adm_del_list"
-              ),
-          ],
-          [
-              InlineKeyboardButton(
-                  text="⏰ Изменить время работы", callback_data="adm_hours"
-              )
-          ],
-      ]
-  )
-  await message.answer(
-      "👑 **Панель администратора буфета:**",
-      reply_markup=kb,
-      parse_mode="Markdown",
-  )
+    if message.from_user.id not in ADMIN_IDS:
+        return
 
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Добавить товар", callback_data="admin_add")],
+        [InlineKeyboardButton(text="🗑 Удалить товар", callback_data="admin_del")],
+        [InlineKeyboardButton(text="📍 Изменить раздевалку", callback_data="admin_room")],
+        [InlineKeyboardButton(text="🚫 Управление ЧС", callback_data="admin_blacklist")]
+    ])
+    room = db.get("room_number", "не указан")
+    await message.answer(f"⚙️ **Админ-панель**\nТекущая раздевалка: **№ {room}**", reply_markup=kb)
 
-@dp.callback_query(F.data == "adm_hours")
-async def admin_change_hours(callback: types.CallbackQuery, state: FSMContext):
-  if callback.from_user.id not in ADMIN_IDS:
-    return
-  current = await get_work_hours()
-  await callback.message.answer(
-      f"Текущее время приема заказов: `{current}`\n\nВведите новый интервал"
-      " в формате `ЧЧ:ММ-ЧЧ:ММ` (например: `15:30-17:30`):"
-  )
-  await state.set_state(AdminStates.waiting_for_hours)
-  await callback.answer()
+@dp.callback_query(F.data == "admin_room")
+async def process_admin_room(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.answer("Введите новый номер или описание раздевалки (например: `3 на 1 этаже`):")
+    await state.set_state(AdminStates.waiting_for_room)
 
+@dp.message(AdminStates.waiting_for_room)
+async def save_room(message: types.Message, state: FSMContext):
+    db["room_number"] = message.text.strip()
+    save_data(db)
+    await message.answer(f"✅ Номер раздевалки обновлен на: **№ {message.text}**")
+    await state.clear()
 
-@dp.message(AdminStates.waiting_for_hours)
-async def save_new_hours(message: types.Message, state: FSMContext):
-  if message.from_user.id not in ADMIN_IDS:
-    return
-  new_hours = message.text.strip()
-  async with aiosqlite.connect(DB_FILE) as db:
-    await db.execute(
-        "INSERT OR REPLACE INTO settings (key, value) VALUES ('work_hours',"
-        " ?)",
-        (new_hours,),
-    )
-    await db.commit()
-  await state.clear()
-  await message.answer(f"✅ Время приема заказов успешно изменено на: {new_hours}")
-
-
-@dp.callback_query(F.data == "adm_add")
-async def admin_add_product(callback: types.CallbackQuery, state: FSMContext):
-  if callback.from_user.id not in ADMIN_IDS:
-    return
-  await callback.message.answer("Введите название нового товара:")
-  await state.set_state(AdminStates.waiting_for_title)
-  await callback.answer()
-
+# Добавление товара с количеством (складом)
+@dp.callback_query(F.data == "admin_add")
+async def admin_add_start(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.answer("Введите название товара:")
+    await state.set_state(AdminStates.waiting_for_title)
 
 @dp.message(AdminStates.waiting_for_title)
-async def admin_got_title(message: types.Message, state: FSMContext):
-  await state.update_data(title=message.text)
-  await message.answer("Введите цену товара (числом, например: 120):")
-  await state.set_state(AdminStates.waiting_for_price)
-
+async def admin_add_title(message: types.Message, state: FSMContext):
+    await state.update_data(title=message.text.strip())
+    await message.answer("Введите цену товара в рублях (например: `50`):")
+    await state.set_state(AdminStates.waiting_for_price)
 
 @dp.message(AdminStates.waiting_for_price)
-async def admin_got_price(message: types.Message, state: FSMContext):
-  if not message.text.isdigit():
-    await message.answer("Цена должна быть числом! Попробуйте снова:")
-    return
-  await state.update_data(price=int(message.text))
-  await message.answer(
-      "Отправьте прямую ссылку на картинку товара (или `-` если без картинки):"
-  )
-  await state.set_state(AdminStates.waiting_for_image)
+async def admin_add_price(message: types.Message, state: FSMContext):
+    try:
+        price = int(message.text.strip())
+        await state.update_data(price=price)
+        await message.answer("Введите количество товара на складе (например: `15`):")
+        await state.set_state(AdminStates.waiting_for_stock)
+    except ValueError:
+        await message.answer("❌ Введите корректное число для цены.")
 
+@dp.message(AdminStates.waiting_for_stock)
+async def admin_add_stock(message: types.Message, state: FSMContext):
+    try:
+        stock = int(message.text.strip())
+        await state.update_data(stock=stock)
+        await message.answer("Отправьте ссылку на картинку товара (или отправьте текст `нет`):")
+        await state.set_state(AdminStates.waiting_for_image)
+    except ValueError:
+        await message.answer("❌ Введите корректное число для количества.")
 
 @dp.message(AdminStates.waiting_for_image)
-async def admin_got_image(message: types.Message, state: FSMContext):
-  data = await state.get_data()
-  title = data["title"]
-  price = data["price"]
-  image = "" if message.text.strip() == "-" else message.text.strip()
+async def admin_add_image(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    image = message.text.strip()
+    if image.lower() == "нет":
+        image = "https://via.placeholder.com/150"
 
-  async with aiosqlite.connect(DB_FILE) as db:
-    await db.execute(
-        "INSERT INTO products (title, price, image) VALUES (?, ?, ?)",
-        (title, price, image),
-    )
-    await db.commit()
+    new_id = len(db["products"]) + 1
+    product = {
+        "id": new_id,
+        "title": data["title"],
+        "price": data["price"],
+        "stock": data["stock"],
+        "image": image
+    }
+    db["products"].append(product)
+    save_data(db)
 
-  await state.clear()
-  await message.answer(f"✅ Товар **{title}** ({price} ₽) успешно добавлен!")
+    await message.answer(f"✅ Товар «{data['title']}» успешно добавлен! Остаток: {data['stock']} шт.")
+    await state.clear()
 
+@dp.callback_query(F.data == "admin_del")
+async def admin_del_start(callback: types.CallbackQuery):
+    if not db["products"]:
+        await callback.answer("Товаров нет.", show_alert=True)
+        return
 
-@dp.callback_query(F.data == "adm_del_list")
-async def admin_del_list(callback: types.CallbackQuery):
-  if callback.from_user.id not in ADMIN_IDS:
-    return
-  async with aiosqlite.connect(DB_FILE) as db:
-    db.row_factory = aiosqlite.Row
-    async with db.execute("SELECT * FROM products") as cursor:
-      products = [dict(row) async for row in cursor]
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"🗑 Удалить: {p['title']}", callback_data=f"del_prod_{p['id']}")]
+        for p in db["products"]
+    ])
+    await callback.message.answer("Выберите товар для удаления:", reply_markup=kb)
 
-  if not products:
-    await callback.message.answer("Список товаров пуст.")
-    await callback.answer()
-    return
+@dp.callback_query(F.data.startswith("del_prod_"))
+async def admin_del_finish(callback: types.CallbackQuery):
+    prod_id = int(callback.data.split("_")[2])
+    db["products"] = [p for p in db["products"] if p["id"] != prod_id]
+    save_data(db)
+    await callback.message.edit_text("✅ Товар успешно удален!")
 
-  kb = InlineKeyboardMarkup(
-      inline_keyboard=[
-          [
-              InlineKeyboardButton(
-                  text=f"❌ Удалить: {p['title']} ({p['price']}₽)",
-                  callback_data=f"del_{p['id']}",
-              )
-          ]
-          for p in products
-      ]
-  )
-  await callback.message.answer(
-      "Выберите товар для удаления:", reply_markup=kb
-  )
-  await callback.answer()
-
-
-@dp.callback_query(F.data.startswith("del_"))
-async def admin_delete_item(callback: types.CallbackQuery):
-  if callback.from_user.id not in ADMIN_IDS:
-    return
-  product_id = int(callback.data.split("_")[1])
-  async with aiosqlite.connect(DB_FILE) as db:
-    await db.execute("DELETE FROM products WHERE id = ?", (product_id,))
-    await db.commit()
-  await callback.message.edit_text("✅ Товар удален из каталога.")
-  await callback.answer()
-
-
+# --- Управление заказами (/zakaz) ---
 @dp.message(Command("zakaz"))
 async def cmd_zakaz(message: types.Message):
-  if message.from_user.id not in ADMIN_IDS:
-    return
+    if message.from_user.id not in ADMIN_IDS:
+        return
 
-  async with aiosqlite.connect(DB_FILE) as db:
-    db.row_factory = aiosqlite.Row
-    async with db.execute(
-        "SELECT * FROM orders WHERE status != 'Выполнен' ORDER BY id DESC LIMIT 10"
-    ) as cursor:
-      orders = [dict(row) async for row in cursor]
+    active_orders = [o for o in db["orders"] if o["status"] == "Новый"]
+    if not active_orders:
+        await message.answer("🎉 Активных заказов нет!")
+        return
 
-  if not orders:
-    await message.answer("📭 Активных заказов пока нет.")
-    return
-
-  for o in orders:
-    taken_text = (
-        f"👤 **Взял в работу:** {o['taken_by']}"
-        if o["taken_by"]
-        else "⚠️ Никем не взят"
-    )
-
-    buttons = []
-    if not o["taken_by"]:
-      buttons.append([
-          InlineKeyboardButton(
-              text="🙋‍♂️ Взять себе", callback_data=f"take_{o['id']}"
-          )
-      ])
-    else:
-      buttons.append([
-          InlineKeyboardButton(
-              text="✅ Завершить заказ", callback_data=f"done_{o['id']}"
-          )
-      ])
-
-    if o["username"] and o["username"] != "нет":
-      buttons.append([
-          InlineKeyboardButton(
-              text="💬 Написать покупателю",
-              url=f"https://t.me/{o['username']}",
-          )
-      ])
-
-    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
-
-    text = (
-        f"📦 **Заказ #{o['id']}** ({o['created_at']})\n"
-        f"👤 Покупатель: {o['full_name']} (@{o['username']})\n\n"
-        f"{o['items']}\n\n"
-        f"💰 **Сумма:** {o['total']} ₽\n"
-        f"📌 **Статус:** {o['status']} | {taken_text}"
-    )
-    await message.answer(text, reply_markup=kb, parse_mode="Markdown")
-
-
-@dp.callback_query(F.data.startswith("take_"))
-async def take_order(callback: types.CallbackQuery):
-  if callback.from_user.id not in ADMIN_IDS:
-    return
-  order_id = int(callback.data.split("_")[1])
-  admin_name = callback.from_user.full_name
-
-  async with aiosqlite.connect(DB_FILE) as db:
-    await db.execute(
-        "UPDATE orders SET status = 'В работе', taken_by = ? WHERE id = ?",
-        (admin_name, order_id),
-    )
-    await db.commit()
-
-  await callback.message.edit_text(
-      f"{callback.message.text}\n\n📌 **Статус:** В работе 👤 **Взял:**"
-      f" {admin_name}",
-      reply_markup=callback.message.reply_markup,
-      parse_mode="Markdown",
-  )
-  await callback.answer(f"Вы взяли заказ #{order_id} в работу!")
-
+    for order in active_orders:
+        items_str = "\n".join([f"• {i['title']} x{i['quantity']}" for i in order['items']])
+        text = (
+            f"📦 **Заказ #{order['id']}**\n"
+            f"👤 Клиент: {order['full_name']} (@{order['username']})\n"
+            f"📅 Дата: {order['date']} | Перемена: {order['break_number']}\n"
+            f"💰 Итого: {order['total']} ₽\n\n"
+            f"Состав:\n{items_str}"
+        )
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Выдан", callback_data=f"done_{order['id']}")],
+            [InlineKeyboardButton(text="❌ Не явился (В ЧС)", callback_data=f"ban_{order['id']}")]
+        ])
+        await message.answer(text, reply_markup=kb)
 
 @dp.callback_query(F.data.startswith("done_"))
-async def finish_order(callback: types.CallbackQuery):
-  if callback.from_user.id not in ADMIN_IDS:
-    return
-  order_id = int(callback.data.split("_")[1])
+async def order_done(callback: types.CallbackQuery):
+    order_id = int(callback.data.split("_")[1])
+    for o in db["orders"]:
+        if o["id"] == order_id:
+            o["status"] = "Выдан"
+            break
+    save_data(db)
+    await callback.message.edit_text(callback.message.text + "\n\n✅ **СТАТУС: ВЫДАН**")
 
-  async with aiosqlite.connect(DB_FILE) as db:
-    await db.execute(
-        "UPDATE orders SET status = 'Выполнен' WHERE id = ?", (order_id,)
+@dp.callback_query(F.data.startswith("ban_"))
+async def order_ban(callback: types.CallbackQuery):
+    order_id = int(callback.data.split("_")[1])
+    target_user_id = None
+    for o in db["orders"]:
+        if o["id"] == order_id:
+            o["status"] = "Не явился"
+            target_user_id = o["user_id"]
+            break
+
+    if target_user_id:
+        if target_user_id not in db["blacklist"]:
+            db["blacklist"].append(target_user_id)
+        save_data(db)
+        try:
+            await bot.send_message(target_user_id, "❌ Вы заблокированы за неявку за заказом. Напишите в поддержку: `/teh`.")
+        except:
+            pass
+
+    await callback.message.edit_text(callback.message.text + "\n\n❌ **ПОЛЬЗОВАТЕЛЬ ОТПРАВЛЕН В ЧС**")
+
+# --- ТЕХПОДДЕРЖКА (/teh) ---
+@dp.message(Command("teh"))
+async def cmd_support(message: types.Message, state: FSMContext):
+    await message.answer("📝 Напишите ваше обращение/жалобу одним сообщением. Поддержка ответит вам в ближайшее время:")
+    await state.set_state(SupportStates.waiting_for_message)
+
+@dp.message(SupportStates.waiting_for_message)
+async def process_support_msg(message: types.Message, state: FSMContext):
+    ticket_id = len(db.get("support_tickets", [])) + 1
+    ticket = {
+        "id": ticket_id,
+        "user_id": message.from_user.id,
+        "username": message.from_user.username or "без username",
+        "full_name": message.from_user.full_name,
+        "text": message.text,
+        "assigned_admin": None
+    }
+    db["support_tickets"].append(ticket)
+    save_data(db)
+
+    await message.answer("✅ Ваше сообщение отправлено администрации. Ожидайте ответа!")
+    await state.clear()
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="👨‍💻 Взять в работу", callback_data=f"take_ticket_{ticket_id}")
+    ]])
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(
+                admin_id,
+                f"🆘 **ОБРАЩЕНИЕ В ПОДДЕРЖКУ #{ticket_id}**\n"
+                f"От: {message.from_user.full_name} (@{ticket['username']})\n"
+                f"ID: `{message.from_user.id}`\n\n"
+                f"Текст:\n{message.text}",
+                reply_markup=kb
+            )
+        except:
+            pass
+
+@dp.callback_query(F.data.startswith("take_ticket_"))
+async def take_ticket(callback: types.CallbackQuery, state: FSMContext):
+    ticket_id = int(callback.data.split("_")[2])
+    admin_name = callback.from_user.full_name
+
+    ticket = next((t for t in db["support_tickets"] if t["id"] == ticket_id), None)
+    if not ticket:
+        await callback.answer("Обращение не найдено.", show_alert=True)
+        return
+
+    if ticket["assigned_admin"] and ticket["assigned_admin"] != admin_name:
+        await callback.answer(f"Уже в работе у {ticket['assigned_admin']}!", show_alert=True)
+        return
+
+    ticket["assigned_admin"] = admin_name
+    save_data(db)
+
+    await callback.message.edit_text(
+        callback.message.text + f"\n\n👨‍💻 **Взял в работу:** {admin_name}",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="✉️ Ответить пользователю", callback_data=f"reply_ticket_{ticket_id}")
+        ]])
     )
-    await db.commit()
 
-  await callback.message.edit_text(
-      f"✅ **Заказ #{order_id} выполнен и закрыт.**", parse_mode="Markdown"
-  )
-  await callback.answer("Заказ закрыт!")
+@dp.callback_query(F.data.startswith("reply_ticket_"))
+async def reply_ticket_start(callback: types.CallbackQuery, state: FSMContext):
+    ticket_id = int(callback.data.split("_")[2])
+    await state.update_data(reply_ticket_id=ticket_id)
+    await callback.message.answer("Введите ответ для пользователя:")
+    await state.set_state(SupportStates.waiting_for_reply)
 
+@dp.message(SupportStates.waiting_for_reply)
+async def send_reply_to_user(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    ticket_id = data.get("reply_ticket_id")
+    ticket = next((t for t in db["support_tickets"] if t["id"] == ticket_id), None)
 
-async def main():
-  await init_db()
-  config = uvicorn.Config(app, host="0.0.0.0", port=PORT, log_level="info")
-  server = uvicorn.Server(config)
-  await asyncio.gather(server.serve(), dp.start_polling(bot))
+    if ticket:
+        try:
+            await bot.send_message(
+                ticket["user_id"],
+                f"👨‍💻 **Ответ от администрации (Техподдержка):**\n\n{message.text}"
+            )
+            await message.answer("✅ Ответ успешно отправлен пользователю!")
+        except Exception as e:
+            await message.answer(f"❌ Не удалось отправить ответ: {e}")
 
-
-if __name__ == "__main__":
-  asyncio.run(main())
+    await state.clear()
