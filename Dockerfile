@@ -2,8 +2,9 @@ FROM python:3.10-slim
 
 WORKDIR /app
 
-RUN pip install --no-cache-dir aiogram fastapi uvicorn pytz aiosqlite pydantic
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-CMD ["python", "main.py"]
+CMD uvicorn main:app --host 0.0.0.0 --port $PORT
