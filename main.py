@@ -66,6 +66,11 @@ class SupportStates(StatesGroup):
     waiting_for_reply = State()
 
 # ---------------- FASTAPI API ----------------
+# Проверка здоровья для Render (защита от Service Unavailable)
+@app.get("/")
+def root():
+    return {"status": "Bot is alive and running!"}
+
 @app.get("/api/products")
 def get_products():
     return db["products"]
