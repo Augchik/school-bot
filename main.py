@@ -27,7 +27,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Хранилище данных
 DATA_FILE = "data.json"
 
 def load_data():
@@ -42,7 +41,6 @@ def load_data():
         }
     with open(DATA_FILE, "r", encoding="utf-8") as f:
         data = json.load(f)
-        # Авто-фикс: если у товара нет поля stock, ставим 0
         for p in data.get("products", []):
             if "stock" not in p:
                 p["stock"] = 0
@@ -54,7 +52,7 @@ def save_data(data):
 
 db = load_data()
 
-# ---------------- FSM (Состояния) ----------------
+# ---------------- FSM ----------------
 class AdminStates(StatesGroup):
     waiting_for_title = State()
     waiting_for_price = State()
@@ -62,7 +60,6 @@ class AdminStates(StatesGroup):
     waiting_for_image = State()
     waiting_for_room = State()
     waiting_for_custom_stock = State()
-    waiting_for_new_price = State()
 
 class SupportStates(StatesGroup):
     waiting_for_message = State()
@@ -78,7 +75,7 @@ def get_products():
 async def cmd_start(message: types.Message):
     user_id = message.from_user.id
     if user_id in db.get("blacklist", []):
-        await message.answer("❌ **Вы заблокированы в системе** за неявку за заказом.\nОбратитесь в поддержку с помощью команды `/teh`.")
+        await message.answer("❌ **Вы заблокированы в системе** за неявку за заказом.\nОбратитесь в поддержку через `/teh`.")
         return
 
     if user_id not in db.get("accepted_rules", []):
@@ -86,7 +83,7 @@ async def cmd_start(message: types.Message):
             "📜 **Правила школьного буфета:**\n\n"
             "1. Бот предназначен для предзаказа продукции.\n"
             "2. Оформляя заказ, вы берете на себя **ответственность** за своевременный самовывоз в назначенную дату и перемену.\n"
-            "3. За неявку без предупреждения следует занесение в **черный список (ЧС)**.\n\n"
+            "3. За неявку следует занесение в **черный список (ЧС)**.\n\n"
             "Нажмите кнопку ниже, чтобы принять правила."
         )
         kb = InlineKeyboardMarkup(inline_keyboard=[[
@@ -112,7 +109,10 @@ async def process_accept_rules(callback: types.CallbackQuery):
     if user_id not in db["accepted_rules"]:
         db["accepted_rules"].append(user_id)
         save_data(db)
-    await callback.message.delete()
+    try:
+        await callback.message.delete()
+    except:
+        pass
     await callback.message.answer("🎉 Спасибо за согласие с правилами!")
     await show_main_menu(callback.message)
 
@@ -121,7 +121,6 @@ async def callback_open_teh(callback: types.CallbackQuery, state: FSMContext):
     await callback.message.answer("📝 Напишите ваше обращение/жалобу одним сообщением:")
     await state.set_state(SupportStates.waiting_for_message)
 
-# --- Прием заказа из WebApp ---
 @dp.message(F.web_app_data)
 async def process_web_app_data(message: types.Message):
     user_id = message.from_user.id
@@ -131,7 +130,6 @@ async def process_web_app_data(message: types.Message):
 
     data = json.loads(message.web_app_data.data)
 
-    # Проверка и списание остатков
     for item in data["items"]:
         prod = next((p for p in db["products"] if p["id"] == item["id"]), None)
         if not prod or prod.get("stock", 0) < item["quantity"]:
@@ -198,11 +196,10 @@ async def cmd_admin(message: types.Message):
     room = db.get("room_number", "не указан")
     await message.answer(f"⚙️ **Админ-панель буфета**\nРаздевалка выдачи: **№ {room}**\n\nВыберите действие:", reply_markup=kb)
 
-# Меню управления наличием товаров
 @dp.callback_query(F.data == "admin_stocks")
 async def admin_stocks_list(callback: types.CallbackQuery):
     if not db["products"]:
-        await callback.answer("Товаров пока нет. Добавьте первый товар!", show_alert=True)
+        await callback.answer("Товаров пока нет.", show_alert=True)
         return
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -238,7 +235,10 @@ async def manage_product(callback: types.CallbackQuery):
         [InlineKeyboardButton(text="✏️ Ввести точное число", callback_data=f"custom_st_{prod_id}")],
         [InlineKeyboardButton(text="🔙 К списку товаров", callback_data="admin_stocks")]
     ])
-    await callback.message.edit_text(text, reply_markup=kb)
+    try:
+        await callback.message.edit_text(text, reply_markup=kb)
+    except:
+        await callback.message.answer(text, reply_markup=kb)
 
 @dp.callback_query(F.data.startswith("add_st_"))
 async def change_stock_delta(callback: types.CallbackQuery):
@@ -271,7 +271,7 @@ async def custom_stock_start(callback: types.CallbackQuery, state: FSMContext):
     await callback.message.answer("Введите точное количество товара на складе (числом):")
     await state.set_state(AdminStates.waiting_for_custom_stock)
 
-@dp.message(AdminStates.waiting_for_custom_stock)
+@dp.message(AdminStates.waiting_for_custom_stock, F.text)
 async def custom_stock_save(message: types.Message, state: FSMContext):
     try:
         val = int(message.text.strip())
@@ -288,32 +288,30 @@ async def custom_stock_save(message: types.Message, state: FSMContext):
     except ValueError:
         await message.answer("❌ Введите корректное целое число.")
 
-# Изменение раздевалки
 @dp.callback_query(F.data == "admin_room")
 async def process_admin_room(callback: types.CallbackQuery, state: FSMContext):
     await callback.message.answer("Введите новый номер раздевалки:")
     await state.set_state(AdminStates.waiting_for_room)
 
-@dp.message(AdminStates.waiting_for_room)
+@dp.message(AdminStates.waiting_for_room, F.text)
 async def save_room(message: types.Message, state: FSMContext):
     db["room_number"] = message.text.strip()
     save_data(db)
     await message.answer(f"✅ Номер раздевалки обновлен на: **№ {message.text}**")
     await state.clear()
 
-# Добавление товара
 @dp.callback_query(F.data == "admin_add")
 async def admin_add_start(callback: types.CallbackQuery, state: FSMContext):
     await callback.message.answer("Введите название товара:")
     await state.set_state(AdminStates.waiting_for_title)
 
-@dp.message(AdminStates.waiting_for_title)
+@dp.message(AdminStates.waiting_for_title, F.text)
 async def admin_add_title(message: types.Message, state: FSMContext):
     await state.update_data(title=message.text.strip())
     await message.answer("Введите цену товара в рублях (например: `60`):")
     await state.set_state(AdminStates.waiting_for_price)
 
-@dp.message(AdminStates.waiting_for_price)
+@dp.message(AdminStates.waiting_for_price, F.text)
 async def admin_add_price(message: types.Message, state: FSMContext):
     try:
         price = int(message.text.strip())
@@ -323,7 +321,7 @@ async def admin_add_price(message: types.Message, state: FSMContext):
     except ValueError:
         await message.answer("❌ Введите корректное число для цены.")
 
-@dp.message(AdminStates.waiting_for_stock)
+@dp.message(AdminStates.waiting_for_stock, F.text)
 async def admin_add_stock(message: types.Message, state: FSMContext):
     try:
         stock = int(message.text.strip())
@@ -333,7 +331,7 @@ async def admin_add_stock(message: types.Message, state: FSMContext):
     except ValueError:
         await message.answer("❌ Введите корректное число для количества.")
 
-@dp.message(AdminStates.waiting_for_image)
+@dp.message(AdminStates.waiting_for_image, F.text)
 async def admin_add_image(message: types.Message, state: FSMContext):
     data = await state.get_data()
     image = message.text.strip()
@@ -373,7 +371,6 @@ async def admin_del_finish(callback: types.CallbackQuery):
     save_data(db)
     await callback.message.edit_text("✅ Товар успешно удален!")
 
-# --- Управление заказами (/zakaz) ---
 @dp.message(Command("zakaz"))
 async def cmd_zakaz(message: types.Message):
     if ADMIN_IDS and message.from_user.id not in ADMIN_IDS:
@@ -432,13 +429,12 @@ async def order_ban(callback: types.CallbackQuery):
 
     await callback.message.edit_text(callback.message.text + "\n\n❌ **ПОЛЬЗОВАТЕЛЬ ОТПРАВЛЕН В ЧС**")
 
-# --- ТЕХПОДДЕРЖКА (/teh) ---
 @dp.message(Command("teh"))
 async def cmd_support(message: types.Message, state: FSMContext):
     await message.answer("📝 Напишите ваше обращение/жалобу одним сообщением:")
     await state.set_state(SupportStates.waiting_for_message)
 
-@dp.message(SupportStates.waiting_for_message)
+@dp.message(SupportStates.waiting_for_message, F.text)
 async def process_support_msg(message: types.Message, state: FSMContext):
     ticket_id = len(db.get("support_tickets", [])) + 1
     ticket = {
@@ -504,7 +500,7 @@ async def reply_ticket_start(callback: types.CallbackQuery, state: FSMContext):
     await callback.message.answer("Введите ответ для пользователя:")
     await state.set_state(SupportStates.waiting_for_reply)
 
-@dp.message(SupportStates.waiting_for_reply)
+@dp.message(SupportStates.waiting_for_reply, F.text)
 async def send_reply_to_user(message: types.Message, state: FSMContext):
     data = await state.get_data()
     ticket_id = data.get("reply_ticket_id")
