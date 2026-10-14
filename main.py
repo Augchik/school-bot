@@ -10,8 +10,8 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 
 # ---------------- CONFIG ----------------
-BOT_TOKEN = os.getenv("BOT_TOKEN", "ТОКЕН_БОТА")
-ADMIN_IDS = [123456789]  # Вставь свой Telegram ID
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "0").split(",") if x.isdigit()]
 
 web_app_url = "https://aufchik-school-shop.hf.space"
 
@@ -27,7 +27,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Хранилища в памяти
+# Хранилище данных
 DATA_FILE = "data.json"
 
 def load_data():
@@ -41,7 +41,12 @@ def load_data():
             "accepted_rules": []
         }
     with open(DATA_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
+        data = json.load(f)
+        # Авто-фикс: если у товара нет поля stock, ставим 0
+        for p in data.get("products", []):
+            if "stock" not in p:
+                p["stock"] = 0
+        return data
 
 def save_data(data):
     with open(DATA_FILE, "w", encoding="utf-8") as f:
@@ -49,13 +54,15 @@ def save_data(data):
 
 db = load_data()
 
-# ---------------- FSM ----------------
+# ---------------- FSM (Состояния) ----------------
 class AdminStates(StatesGroup):
     waiting_for_title = State()
     waiting_for_price = State()
     waiting_for_stock = State()
     waiting_for_image = State()
     waiting_for_room = State()
+    waiting_for_custom_stock = State()
+    waiting_for_new_price = State()
 
 class SupportStates(StatesGroup):
     waiting_for_message = State()
@@ -71,18 +78,16 @@ def get_products():
 async def cmd_start(message: types.Message):
     user_id = message.from_user.id
     if user_id in db.get("blacklist", []):
-        await message.answer("❌ **Вы заблокированы в системе** за неявку за заказом.\nЕсли это ошибка, обратитесь в поддержку с помощью команды `/teh`.")
+        await message.answer("❌ **Вы заблокированы в системе** за неявку за заказом.\nОбратитесь в поддержку с помощью команды `/teh`.")
         return
 
-    # Проверяем, принял ли пользователь правила
     if user_id not in db.get("accepted_rules", []):
         rules_text = (
-            "📜 **Пользовательское соглашение и правила школьного буфета:**\n\n"
-            "1. Настоящий бот является информационной системой для предварительного заказа продукции в школьном буфете.\n"
-            "2. Оформляя заказ, пользователь подтверждает свое согласие на покупку выбранных позиций и берет на себя **полную личную ответственность** за своевременный самовывоз заказа в назначенное время (дата и номер перемены) и место (раздевалка).\n"
-            "3. Заказы, оставленные без забора (неявка), фиксируются администрацией. При повторных нарушениях пользователь автоматически вносится в **черный список (ЧС)** с правом обжалования через техническую поддержку (`/teh`).\n"
-            "4. Администрация не несет ответственности за технические сбои связи или задержки учебного процесса.\n\n"
-            "Нажимая кнопку ниже, вы подтверждаете ознакомление и полное согласие с правилами."
+            "📜 **Правила школьного буфета:**\n\n"
+            "1. Бот предназначен для предзаказа продукции.\n"
+            "2. Оформляя заказ, вы берете на себя **ответственность** за своевременный самовывоз в назначенную дату и перемену.\n"
+            "3. За неявку без предупреждения следует занесение в **черный список (ЧС)**.\n\n"
+            "Нажмите кнопку ниже, чтобы принять правила."
         )
         kb = InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(text="✅ Я согласен с правилами", callback_data="accept_rules")
@@ -97,11 +102,13 @@ async def show_main_menu(message: types.Message):
         [InlineKeyboardButton(text="🍕 Открыть каталог буфета", web_app=WebAppInfo(url=web_app_url))],
         [InlineKeyboardButton(text="📦 Мои заказы", callback_data="my_orders"), InlineKeyboardButton(text="🆘 Техподдержка", callback_data="open_teh")]
     ])
-    await message.answer("Привет! Добро пожаловать в школьный буфет 🥪\n\nИспользуйте меню ниже для работы с системой:", reply_markup=kb)
+    await message.answer("Привет! Добро пожаловать в школьный буфет 🥪\n\nИспользуйте меню ниже:", reply_markup=kb)
 
 @dp.callback_query(F.data == "accept_rules")
 async def process_accept_rules(callback: types.CallbackQuery):
     user_id = callback.from_user.id
+    if "accepted_rules" not in db:
+        db["accepted_rules"] = []
     if user_id not in db["accepted_rules"]:
         db["accepted_rules"].append(user_id)
         save_data(db)
@@ -111,7 +118,7 @@ async def process_accept_rules(callback: types.CallbackQuery):
 
 @dp.callback_query(F.data == "open_teh")
 async def callback_open_teh(callback: types.CallbackQuery, state: FSMContext):
-    await callback.message.answer("📝 Напишите ваше обращение/жалобу одним сообщением. Поддержка ответит вам в ближайшее время:")
+    await callback.message.answer("📝 Напишите ваше обращение/жалобу одним сообщением:")
     await state.set_state(SupportStates.waiting_for_message)
 
 # --- Прием заказа из WebApp ---
@@ -119,24 +126,23 @@ async def callback_open_teh(callback: types.CallbackQuery, state: FSMContext):
 async def process_web_app_data(message: types.Message):
     user_id = message.from_user.id
     if user_id in db.get("blacklist", []):
-        await message.answer("❌ Вы не можете оформлять заказы, так как находитесь в черном списке. Обратитесь в `/teh`.")
+        await message.answer("❌ Вы заблокированы. Обратитесь в `/teh`.")
         return
 
     data = json.loads(message.web_app_data.data)
 
-    # Проверка и списание остатков на складе
+    # Проверка и списание остатков
     for item in data["items"]:
         prod = next((p for p in db["products"] if p["id"] == item["id"]), None)
-        if not prod or prod["stock"] < item["quantity"]:
+        if not prod or prod.get("stock", 0) < item["quantity"]:
             await message.answer(f"❌ Ошибка! Товара «{item['title']}» осталось недостаточно на складе.")
             return
 
-    # Уменьшаем остатки
     for item in data["items"]:
         for prod in db["products"]:
             if prod["id"] == item["id"]:
                 prod["stock"] -= item["quantity"]
-    
+
     order_id = len(db["orders"]) + 1
     order_info = {
         "id": order_id,
@@ -162,7 +168,7 @@ async def process_web_app_data(message: types.Message):
         f"📅 **Дата:** {data['date']}\n"
         f"⏰ **Перемена:** {data['break_number']}-я перемена\n"
         f"📍 **Место выдачи:** Раздевалка № {room}\n\n"
-        f"⚠️ *Обязательно приходите вовремя! Неявка ведет к внесению в ЧС.*"
+        f"⚠️ *Обязательно приходите вовремя!*"
     )
 
     admin_msg = (
@@ -178,57 +184,114 @@ async def process_web_app_data(message: types.Message):
         except:
             pass
 
-# --- ИСТОРИЯ ЗАКАЗОВ (/history) ---
-@dp.message(Command("history"))
-async def cmd_history(message: types.Message):
-    user_id = message.from_user.id
-    user_orders = [o for o in db["orders"] if o["user_id"] == user_id]
-
-    if not user_orders:
-        await message.answer("📦 У вас пока нет оформленных заказов.")
-        return
-
-    text = "📜 **Ваша история заказов:**\n\n"
-    for o in user_orders[-5:]:  включая последние 5 заказов
-        items_str = ", ".join([f"{i['title']} x{i['quantity']}" for i in o['items']])
-        text += f"• **Заказ #{o['id']}** ({o['status']})\n  📅 {o['date']} | {o['break_number']} перемена\n  🛒 {items_str}\n  💰 Итого: {o['total']} ₽\n\n"
-
-    await message.answer(text)
-
-@dp.callback_query(F.data == "my_orders")
-async def callback_my_orders(callback: types.CallbackQuery):
-    user_id = callback.from_user.id
-    user_orders = [o for o in db["orders"] if o["user_id"] == user_id]
-
-    if not user_orders:
-        await callback.message.answer("📦 У вас пока нет оформленных заказов.")
-        return
-
-    text = "📜 **Ваша история заказов:**\n\n"
-    for o in user_orders[-5:]:
-        items_str = ", ".join([f"{i['title']} x{i['quantity']}" for i in o['items']])
-        text += f"• **Заказ #{o['id']}** ({o['status']})\n  📅 {o['date']} | {o['break_number']} перемена\n  🛒 {items_str}\n  💰 Итого: {o['total']} ₽\n\n"
-
-    await callback.message.answer(text)
-
 # --- АДМИН ПАНЕЛЬ (/admin) ---
 @dp.message(Command("admin"))
 async def cmd_admin(message: types.Message):
-    if message.from_user.id not in ADMIN_IDS:
+    if ADMIN_IDS and message.from_user.id not in ADMIN_IDS:
         return
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="➕ Добавить товар", callback_data="admin_add")],
-        [InlineKeyboardButton(text="🗑 Удалить товар", callback_data="admin_del")],
+        [InlineKeyboardButton(text="📦 Наличие и склад", callback_data="admin_stocks")],
+        [InlineKeyboardButton(text="➕ Добавить товар", callback_data="admin_add"), InlineKeyboardButton(text="🗑 Удалить товар", callback_data="admin_del")],
         [InlineKeyboardButton(text="📍 Изменить раздевалку", callback_data="admin_room")],
-        [InlineKeyboardButton(text="🚫 Управление ЧС", callback_data="admin_blacklist")]
     ])
     room = db.get("room_number", "не указан")
-    await message.answer(f"⚙️ **Админ-панель**\nТекущая раздевалка: **№ {room}**", reply_markup=kb)
+    await message.answer(f"⚙️ **Админ-панель буфета**\nРаздевалка выдачи: **№ {room}**\n\nВыберите действие:", reply_markup=kb)
 
+# Меню управления наличием товаров
+@dp.callback_query(F.data == "admin_stocks")
+async def admin_stocks_list(callback: types.CallbackQuery):
+    if not db["products"]:
+        await callback.answer("Товаров пока нет. Добавьте первый товар!", show_alert=True)
+        return
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"{p['title']} (Остаток: {p.get('stock',0)} шт)", callback_data=f"manage_p_{p['id']}")]
+        for p in db["products"]
+    ])
+    await callback.message.answer("📦 **Выберите товар для управления наличием:**", reply_markup=kb)
+
+@dp.callback_query(F.data.startswith("manage_p_"))
+async def manage_product(callback: types.CallbackQuery):
+    prod_id = int(callback.data.split("_")[2])
+    prod = next((p for p in db["products"] if p["id"] == prod_id), None)
+    if not prod:
+        await callback.answer("Товар не найден", show_alert=True)
+        return
+
+    text = (
+        f"🍕 **Товар:** {prod['title']}\n"
+        f"💰 **Цена:** {prod['price']} ₽\n"
+        f"📦 **В наличии:** {prod.get('stock', 0)} шт."
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="+1", callback_data=f"add_st_{prod_id}_1"),
+            InlineKeyboardButton(text="+5", callback_data=f"add_st_{prod_id}_5"),
+            InlineKeyboardButton(text="+10", callback_data=f"add_st_{prod_id}_10")
+        ],
+        [
+            InlineKeyboardButton(text="-1", callback_data=f"add_st_{prod_id}_-1"),
+            InlineKeyboardButton(text="-5", callback_data=f"add_st_{prod_id}_-5"),
+            InlineKeyboardButton(text="Обнулить (0)", callback_data=f"set_st_{prod_id}_0")
+        ],
+        [InlineKeyboardButton(text="✏️ Ввести точное число", callback_data=f"custom_st_{prod_id}")],
+        [InlineKeyboardButton(text="🔙 К списку товаров", callback_data="admin_stocks")]
+    ])
+    await callback.message.edit_text(text, reply_markup=kb)
+
+@dp.callback_query(F.data.startswith("add_st_"))
+async def change_stock_delta(callback: types.CallbackQuery):
+    _, _, prod_id, delta = callback.data.split("_")
+    prod_id, delta = int(prod_id), int(delta)
+
+    for p in db["products"]:
+        if p["id"] == prod_id:
+            p["stock"] = max(0, p.get("stock", 0) + delta)
+            break
+    save_data(db)
+    await manage_product(callback)
+
+@dp.callback_query(F.data.startswith("set_st_"))
+async def set_stock_exact(callback: types.CallbackQuery):
+    _, _, prod_id, val = callback.data.split("_")
+    prod_id, val = int(prod_id), int(val)
+
+    for p in db["products"]:
+        if p["id"] == prod_id:
+            p["stock"] = val
+            break
+    save_data(db)
+    await manage_product(callback)
+
+@dp.callback_query(F.data.startswith("custom_st_"))
+async def custom_stock_start(callback: types.CallbackQuery, state: FSMContext):
+    prod_id = int(callback.data.split("_")[2])
+    await state.update_data(edit_prod_id=prod_id)
+    await callback.message.answer("Введите точное количество товара на складе (числом):")
+    await state.set_state(AdminStates.waiting_for_custom_stock)
+
+@dp.message(AdminStates.waiting_for_custom_stock)
+async def custom_stock_save(message: types.Message, state: FSMContext):
+    try:
+        val = int(message.text.strip())
+        data = await state.get_data()
+        prod_id = data.get("edit_prod_id")
+
+        for p in db["products"]:
+            if p["id"] == prod_id:
+                p["stock"] = max(0, val)
+                break
+        save_data(db)
+        await message.answer("✅ Наличие товара успешно обновлено!")
+        await state.clear()
+    except ValueError:
+        await message.answer("❌ Введите корректное целое число.")
+
+# Изменение раздевалки
 @dp.callback_query(F.data == "admin_room")
 async def process_admin_room(callback: types.CallbackQuery, state: FSMContext):
-    await callback.message.answer("Введите новый номер или описание раздевалки (например: `3 на 1 этаже`):")
+    await callback.message.answer("Введите новый номер раздевалки:")
     await state.set_state(AdminStates.waiting_for_room)
 
 @dp.message(AdminStates.waiting_for_room)
@@ -238,7 +301,7 @@ async def save_room(message: types.Message, state: FSMContext):
     await message.answer(f"✅ Номер раздевалки обновлен на: **№ {message.text}**")
     await state.clear()
 
-# Добавление товара с количеством (складом)
+# Добавление товара
 @dp.callback_query(F.data == "admin_add")
 async def admin_add_start(callback: types.CallbackQuery, state: FSMContext):
     await callback.message.answer("Введите название товара:")
@@ -247,7 +310,7 @@ async def admin_add_start(callback: types.CallbackQuery, state: FSMContext):
 @dp.message(AdminStates.waiting_for_title)
 async def admin_add_title(message: types.Message, state: FSMContext):
     await state.update_data(title=message.text.strip())
-    await message.answer("Введите цену товара в рублях (например: `50`):")
+    await message.answer("Введите цену товара в рублях (например: `60`):")
     await state.set_state(AdminStates.waiting_for_price)
 
 @dp.message(AdminStates.waiting_for_price)
@@ -255,7 +318,7 @@ async def admin_add_price(message: types.Message, state: FSMContext):
     try:
         price = int(message.text.strip())
         await state.update_data(price=price)
-        await message.answer("Введите количество товара на складе (например: `15`):")
+        await message.answer("Введите количество товара на складе (например: `10`):")
         await state.set_state(AdminStates.waiting_for_stock)
     except ValueError:
         await message.answer("❌ Введите корректное число для цены.")
@@ -265,7 +328,7 @@ async def admin_add_stock(message: types.Message, state: FSMContext):
     try:
         stock = int(message.text.strip())
         await state.update_data(stock=stock)
-        await message.answer("Отправьте ссылку на картинку товара (или отправьте текст `нет`):")
+        await message.answer("Отправьте ссылку на картинку товара (или напишите `нет`):")
         await state.set_state(AdminStates.waiting_for_image)
     except ValueError:
         await message.answer("❌ Введите корректное число для количества.")
@@ -313,7 +376,7 @@ async def admin_del_finish(callback: types.CallbackQuery):
 # --- Управление заказами (/zakaz) ---
 @dp.message(Command("zakaz"))
 async def cmd_zakaz(message: types.Message):
-    if message.from_user.id not in ADMIN_IDS:
+    if ADMIN_IDS and message.from_user.id not in ADMIN_IDS:
         return
 
     active_orders = [o for o in db["orders"] if o["status"] == "Новый"]
@@ -357,11 +420,13 @@ async def order_ban(callback: types.CallbackQuery):
             break
 
     if target_user_id:
+        if "blacklist" not in db:
+            db["blacklist"] = []
         if target_user_id not in db["blacklist"]:
             db["blacklist"].append(target_user_id)
         save_data(db)
         try:
-            await bot.send_message(target_user_id, "❌ Вы заблокированы за неявку за заказом. Напишите в поддержку: `/teh`.")
+            await bot.send_message(target_user_id, "❌ Вы заблокированы за неявку за заказом. Обратитесь в `/teh`.")
         except:
             pass
 
@@ -370,7 +435,7 @@ async def order_ban(callback: types.CallbackQuery):
 # --- ТЕХПОДДЕРЖКА (/teh) ---
 @dp.message(Command("teh"))
 async def cmd_support(message: types.Message, state: FSMContext):
-    await message.answer("📝 Напишите ваше обращение/жалобу одним сообщением. Поддержка ответит вам в ближайшее время:")
+    await message.answer("📝 Напишите ваше обращение/жалобу одним сообщением:")
     await state.set_state(SupportStates.waiting_for_message)
 
 @dp.message(SupportStates.waiting_for_message)
@@ -384,6 +449,8 @@ async def process_support_msg(message: types.Message, state: FSMContext):
         "text": message.text,
         "assigned_admin": None
     }
+    if "support_tickets" not in db:
+        db["support_tickets"] = []
     db["support_tickets"].append(ticket)
     save_data(db)
 
@@ -454,3 +521,8 @@ async def send_reply_to_user(message: types.Message, state: FSMContext):
             await message.answer(f"❌ Не удалось отправить ответ: {e}")
 
     await state.clear()
+
+# --- RUNNER ---
+@app.on_event("startup")
+async def on_startup():
+    asyncio.create_task(dp.start_polling(bot))
